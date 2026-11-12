@@ -28,9 +28,13 @@ Captured mode uses the original runs/default directory, native-resolution compar
 
 Fetch the producer timestamp before and after both PNGs, check source age (120 s default, America/Chicago), PNG integrity and complete decoding. Repeated producer timestamps or unchanged title bands in either image do not advance confirmation. On a timestamp race, download error or invalid PNG, the monitor waits three seconds and repeats the entire acquisition once for that group. JSON output includes attempts and, when retried, retry_reason. A stale timestamp skips the immediate retry. If both attempts fail, watch advances to the next group and returns on its next sweep. Stale or unreadable input leaves open incidents intact. The writer updates separate files, so these tests reduce races but cannot guarantee an atomic acquisition. The watch interval is a pause after each sequential sweep.
 
-Crop the detector axes using normalized bounds measured from a native group 3 PNG. Divide the crop into 16 columns and 32 rows, or 8 by 8 cells per tile. In wiki mode, area-resample each plot interior to 160 by 320 pixels before thresholding, to compare the native PNG and the smaller printed reference on a common grid. Compare the fraction of non-white area in each cell with its own baseline in both maps. The proposed defaults require baseline coverage of at least 10% and current coverage at most 35% of baseline in each metric. Two neighboring cells must meet both tests in the same locations on two distinct frames no more than 120 s apart. The monitor saves one comparison PNG with both metrics per newly affected tile, outlining the confirmed cells. Two successive clear observations close that tile's incident. Additional losses on a tile already open are part of that incident. Work state persists across restarts.
+Within the plot crop, score each chip inside its own projected footprint. The bundled geometry tables contain the tile ID, chip ID and normalized bounding box of its channel centers, expanded by half a pixel pitch. Geometry Y increases upwards. Wiki mode area-resamples to 160 by 320 pixels first, giving about 8 by 8 image samples per chip. Captured mode uses the native resolution. PNG registration is approximate, especially at wiki resolution.
 
-Use --ratio, --min-coverage, and --max-gap to tune against labeled data. Regression tests cover the printed examples; the wiki provides one labeled missing-channel image pair and no independent time sequence. Sensitivity and false-alarm rates across runs remain unmeasured. Bright or normally sparse cells below the baseline floor are insensitive; small losses within a cell can be missed. A changing run mode can affect both maps. A repeatedly malformed but valid producer rendering can mimic a detector outage. This tool measures a map symptom.
+Each panel must have at least 10% reference coverage on the chip. With the defaults, either RMS or mean must retain at most 35% of its reference coverage, while the other may retain up to 60%. Raise --secondary-ratio to loosen corroboration or set it to .35 to restore the strict two-panel threshold. Lowering these retained-coverage cutoffs makes detection stricter. A chip already blank in the reference cannot establish a new loss.
+
+Two edge-adjacent chips within one tile must pass on the same two fresh updates no more than 120 seconds apart. Use --allow-single-chip for persistent isolated losses when testing. Opening events list the supported chip IDs and the evidence outlines their footprints. Resolution requires two successive clear frames. The first evaluation after upgrading discards old grid hits and retains open tile incidents. Chip IDs are inferred from the map image and selected geometry.
+
+Regression replay covers the wiki examples and the group 2 bottom-left strip in the November 11 19:42:57 images. The group 2 fixtures contain the cropped detector at wiki scoring resolution. Tests simulate an advancing title because only one affected acquisition is available for each example. False-positive rates across running conditions remain unmeasured.
 
 ## Offline and on-site sources
 
@@ -43,6 +47,8 @@ The guide follows the website layout (odd groups above even groups). PlotMetrics
 ```sh
 python geometry_sheet.py ../CRS_DAQ/pacmon/layout --name CRS_DAQ
 python geometry_sheet.py ../pacmon/layout --name pacmon
+python chip_geometry.py ../CRS_DAQ/pacmon/layout chips_CRS_DAQ.npz
+python chip_geometry.py ../pacmon/layout chips_pacmon.npz
 ```
 
 ## Deployment and Grafana

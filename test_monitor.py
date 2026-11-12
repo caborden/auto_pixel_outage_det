@@ -81,9 +81,9 @@ class IncidentTest(unittest.TestCase):
                         f"2026-11-11\n15:{minute:02d}:00")
                     for metric in monitor.METRICS:
                         name = f"iog_{group}_{metric}.png"
-                        src = "tests/fixtures" if outage and group == 1 else "wiki_reference"
+                        src = "tests/fixtures" if outage and group in (1, 2) else "wiki_reference"
                         with Image.open(project / src / name) as original:
-                            im = original.resize((336, 688), Image.Resampling.NEAREST)
+                            im = original.copy() if group == 2 else original.resize((336, 688), Image.Resampling.NEAREST)
                         # The wiki has one outage frame. Simulate advancing titles.
                         ImageDraw.Draw(im).text((2, 2), str(minute), fill="black")
                         im.save(root / name)
@@ -97,5 +97,6 @@ class IncidentTest(unittest.TestCase):
                 self.assertTrue(all(not r["active"] for r in sweep(minute)))
             self.assertEqual(sweep(2, outage=True)[0]["active"], [])
             results = sweep(3, outage=True)
-            self.assertEqual([r["active"] for r in results], [[6]] + [[] for _ in range(7)])
+            self.assertEqual([r["active"] for r in results], [[6], [8]] + [[] for _ in range(6)])
+            self.assertEqual(results[1]["events"][0]["chips"], [13, 14, 15, 16])
             self.assertTrue(Path(results[0]["events"][0]["image"]).is_file())

@@ -21,7 +21,7 @@ METRICS = ("rms", "mean")
 
 # Interior of the gonum axes, measured on a 2369 x 4876 native RMS map.
 ROI = (.042, .075, .997, .985)
-COLS, ROWS = 16, 32
+
 
 
 def read(source, name):
@@ -85,14 +85,18 @@ def plot_box(im):
     return tuple(round(f * n) for f, n in zip(ROI, im.size * 2))
 
 
-def occupancy(im, wiki=False):
+def occupancy(im, boxes, wiki=False):
     # Threshold before averaging so scattered hits count by their area.
     crop = im.crop(plot_box(im))
     if wiki:
         # Compare displayed coverage at the resolution of the wiki plot interiors.
         crop = crop.resize((160, 320), Image.Resampling.BOX)
     mask = crop.convert("L").point(lambda v: 255 if v < 242 else 0)
-    return np.asarray(mask.resize((COLS, ROWS), Image.Resampling.BOX)) / 255.
+    # Integrate the binary mask inside each projected chip footprint.
+    scaled = np.rint(boxes * (mask.width, mask.height, mask.width, mask.height)).astype(int)
+    pixels = np.asarray(mask)
+    return np.array([pixels[top:bottom, left:right].mean() / 255
+                     for left, top, right, bottom in scaled])
 
 
 def title_id(im):
@@ -118,7 +122,7 @@ def baseline(folder, stamp, maps):
         stage.rename(target)
 
 
-def evidence(path, refs, maps, cells, group, stamp, reference_stamp):
+def evidence(path, refs, maps, boxes, group, stamp, reference_stamp):
     canvas = Image.new("RGB", (860, 2 * 910), "white")
     pen = ImageDraw.Draw(canvas)
     font = ImageFont.load_default(size=18)
@@ -134,10 +138,10 @@ def evidence(path, refs, maps, cells, group, stamp, reference_stamp):
             pen.text((x, y-26), (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
                       if ts is not None else "Shifter wiki  /  2026-11-10"), font=font, fill="black")
             left, top, right, bottom = plot_box(thumb)
-            dx, dy = (right-left)/COLS, (bottom-top)/ROWS
-            for cell in cells:
-                r, c = divmod(cell, COLS)
-                pen.rectangle((x+left+c*dx, y+top+r*dy, x+left+(c+1)*dx, y+top+(r+1)*dy), outline="#0082ff", width=2)
+            for x0, y0, x1, y1 in boxes:
+                pen.rectangle((x+left+x0*(right-left), y+top+y0*(bottom-top),
+                               x+left+x1*(right-left), y+top+y1*(bottom-top)),
+                              outline="#0082ff", width=2)
     canvas.save(path)
 
 
@@ -155,7 +159,10 @@ def evaluate(folder, group, stamp, maps, args):
         return {"status": "waiting_for_new_frame"}
     titles = {m: title_id(im) for m, im in maps.items()}
     refs = {}
-    candidates = np.ones((ROWS, COLS), dtype=bool)
+    chips = args.chips[group]
+    boxes = chips[:, 2:]
+    eligible = np.ones(len(chips), dtype=bool)
+    ratios = []
     for m in METRICS:
         filename = f"iog_{group}_{m}.png" if wiki else f"{m}.png"
         with Image.open(refdir / filename) as im:
@@ -167,30 +174,33 @@ def evaluate(folder, group, stamp, maps, args):
             previous_title = title_id(refs[m])
         if titles[m] == previous_title:
             return {"status": "waiting_for_new_frame"}
-        expected = occupancy(refs[m], wiki)
-        candidates &= (expected >= args.min_coverage) & (occupancy(maps[m], wiki) <= expected * args.ratio)
+        expected = occupancy(refs[m], boxes, wiki)
+        eligible &= expected >= args.min_coverage
+        ratios.append(occupancy(maps[m], boxes, wiki) / np.maximum(expected, 1e-9))
+    candidates = eligible & (np.minimum(*ratios) <= args.ratio) & (np.maximum(*ratios) <= args.secondary_ratio)
     hits = set(np.flatnonzero(candidates).tolist())
-    consecutive = stamp - state.get("stamp", 0) <= args.max_gap
+    consecutive = state.get("scoring") == "chip-v1" and stamp - state["stamp"] <= args.max_gap
     previous = set(state.get("hits", [])) if consecutive else set()
     active = set(state.get("active", []))
     events = []
-    for row, tiles in enumerate(args.tiles[str(group)]):
-        for col, tile in enumerate(tiles):
-            region = {r*COLS+c for r in range(row*8, row*8+8) for c in range(col*8, col*8+8)}
-            persistent = hits & previous & region
-            # Require an edge-connected pair; isolated quiet cells are common.
-            adjacent = {i for i in persistent if any(
-                n in persistent and abs(n//COLS-i//COLS)+abs(n%COLS-i%COLS)==1
-                for n in (i-1, i+1, i-COLS, i+COLS))}
-            if adjacent and tile not in active:
-                path = folder / f"{stamp}-T{tile}.png"
-                evidence(path, refs, maps, adjacent, group, stamp, reference_stamp)
-                active.add(tile)
-                events.append({"tile": tile, "event": "opened", "image": str(path)})
-            elif tile in active and consecutive and not (hits | previous) & region:
-                active.remove(tile)
-                events.append({"tile": tile, "event": "resolved"})
-    save_json(statefile, dict(geometry=args.geometry, reference=args.reference, stamp=stamp, titles=titles, hits=sorted(hits), active=sorted(active)))
+    for tile in range(1, 9):
+        region = set(np.flatnonzero(chips[:, 0] == tile).tolist())
+        persistent = hits & previous & region
+        # Each tile occupies 100 consecutive indices in physical row-major order.
+        supported = {i for i in persistent if args.allow_single_chip or any(
+            n in persistent and abs(n//10-i//10)+abs(n%10-i%10) == 1
+            for n in (i-1, i+1, i-10, i+10))}
+        if supported and tile not in active:
+            path = folder / f"{stamp}-T{tile}.png"
+            indices = sorted(supported)
+            evidence(path, refs, maps, boxes[indices], group, stamp, reference_stamp)
+            active.add(tile)
+            events.append({"tile": tile, "event": "opened", "image": str(path),
+                           "chips": sorted(chips[indices, 1].astype(int).tolist())})
+        elif tile in active and consecutive and not (hits | previous) & region:
+            active.remove(tile)
+            events.append({"tile": tile, "event": "resolved"})
+    save_json(statefile, dict(scoring="chip-v1", geometry=args.geometry, reference=args.reference, stamp=stamp, titles=titles, hits=sorted(hits), active=sorted(active)))
     return dict(status="evaluated", stamp=stamp, active=sorted(active), events=events)
 
 
@@ -207,6 +217,10 @@ def main():
     p.add_argument("--max-age", type=int, default=120, help="seconds; 0 disables for offline replay")
     p.add_argument("--max-gap", type=int, default=120)
     p.add_argument("--ratio", type=float, default=.35)
+    p.add_argument("--secondary-ratio", type=float, default=None,
+                   help="maximum retained coverage in the corroborating panel (default: at least 0.60)")
+    p.add_argument("--allow-single-chip", action="store_true",
+                   help="open on one persistent chip without a neighboring chip")
     p.add_argument("--min-coverage", type=float, default=.10)
     p.add_argument("--geometry", choices=("CRS_DAQ", "pacmon"), default="CRS_DAQ")
     args = p.parse_args()
@@ -216,9 +230,12 @@ def main():
         p.error("wiki references are bundled; run check or watch")
     if args.work is None:
         args.work = Path("runs/wiki" if args.reference == "wiki" else "runs/default")
-    args.tiles = json.loads(Path(__file__).with_name(f"tiles_{args.geometry}.json").read_text())
+    with np.load(Path(__file__).with_name(f"chips_{args.geometry}.npz")) as layout:
+        args.chips = {group: layout[str(group)] for group in args.groups}
+    if args.secondary_ratio is None:
+        args.secondary_ratio = max(.60, args.ratio)
     if args.interval <= 0 or args.max_gap <= 0 or args.max_age < 0 or not (
-            0 < args.ratio < 1 and 0 < args.min_coverage <= 1):
+            0 < args.ratio <= args.secondary_ratio < 1 and 0 < args.min_coverage <= 1):
         p.error("invalid time interval or coverage threshold")
     while True:
         failed = False
