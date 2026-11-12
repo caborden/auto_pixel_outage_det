@@ -1,5 +1,6 @@
 """Compare fresh RMS and mean pixel maps with an operator-reviewed reference."""
 import argparse
+from http.client import IncompleteRead
 import hashlib
 import io
 import json
@@ -46,6 +47,10 @@ def decode(data):
         return im.convert("RGB")
 
 
+class StaleFrame(ValueError):
+    pass
+
+
 def acquire(args, group):
     name = f"iog_{group}_last_update.txt"
     stamp = read(args.source, name).decode().split()
@@ -53,13 +58,27 @@ def acquire(args, group):
         tzinfo=ZoneInfo(args.timezone))
     age = time.time() - moment.timestamp()
     if args.max_age and not -15 <= age <= args.max_age:
-        raise ValueError(f"source age {age:.0f}s")
+        raise StaleFrame(f"source age {age:.0f}s")
     images = {m: decode(read(args.source, f"iog_{group}_{m}.png")) for m in METRICS}
     if read(args.source, name).decode().split() != stamp:
         raise ValueError("update changed during download")
     if images["rms"].size != images["mean"].size:
         raise ValueError("map dimensions disagree")
     return int(moment.timestamp()), images
+
+
+def acquire_with_retry(args, group, result):
+    for attempt in (1, 2):
+        result["attempts"] = attempt
+        try:
+            return acquire(args, group)
+        except StaleFrame:
+            raise
+        except (OSError, ValueError, SyntaxError, EOFError, IncompleteRead) as exc:
+            if attempt == 2:
+                raise
+            result["retry_reason"] = str(exc)
+        time.sleep(3)
 
 
 def plot_box(im):
@@ -205,18 +224,19 @@ def main():
         failed = False
         for group in args.groups:
             folder = args.work / f"iog_{group}"
+            acquisition = {}
             try:
                 folder.mkdir(parents=True, exist_ok=True)
-                stamp, maps = acquire(args, group)
+                stamp, maps = acquire_with_retry(args, group, acquisition)
                 if args.action == "baseline":
                     baseline(folder, stamp, maps)
                     result = {"status": "baseline_saved", "stamp": stamp}
                 else:
                     result = evaluate(folder, group, stamp, maps, args)
-            except (OSError, ValueError, SyntaxError, EOFError) as exc:
+            except (OSError, ValueError, SyntaxError, EOFError, IncompleteRead) as exc:
                 result = {"status": "unavailable", "reason": str(exc)}
                 failed = True
-            print(json.dumps({"io_group": group, "reference": args.reference, **result}), flush=True)
+            print(json.dumps({"io_group": group, "reference": args.reference, **acquisition, **result}), flush=True)
         if args.action != "watch":
             return int(failed)
         time.sleep(args.interval)
