@@ -13,6 +13,8 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from delayed import score
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -122,12 +124,12 @@ def baseline(folder, stamp, maps):
         stage.rename(target)
 
 
-def evidence(path, refs, maps, boxes, group, stamp, reference_stamp):
+def evidence(path, refs, maps, boxes, group, stamp, reference_stamp, adaptive=False):
     canvas = Image.new("RGB", (860, 2 * 910), "white")
     pen = ImageDraw.Draw(canvas)
     font = ImageFont.load_default(size=18)
     for row, metric in enumerate(METRICS):
-        for col, (label, src, ts) in enumerate((("Reference", refs, reference_stamp), ("Current", maps, stamp))):
+        for col, (label, src, ts) in enumerate((("Wiki mask" if adaptive else "Reference", refs, reference_stamp), ("Current", maps, stamp))):
             original = src[metric]
             scale = min(420 / original.width, 850 / original.height)
             thumb = original.resize((round(original.width * scale), round(original.height * scale)),
@@ -146,7 +148,8 @@ def evidence(path, refs, maps, boxes, group, stamp, reference_stamp):
 
 
 def evaluate(folder, group, stamp, maps, args):
-    wiki = args.reference == "wiki"
+    adaptive = args.reference == "delayed"
+    wiki = args.reference != "captured"
     refdir = Path(__file__).with_name("wiki_reference") if wiki else folder / "baseline"
     reference_stamp = None if wiki else json.loads((refdir / "source.json").read_text())
     statefile = folder / "state.json"
@@ -163,6 +166,7 @@ def evaluate(folder, group, stamp, maps, args):
     boxes = chips[:, 2:]
     eligible = np.ones(len(chips), dtype=bool)
     ratios = []
+    samples = []
     for m in METRICS:
         filename = f"iog_{group}_{m}.png" if wiki else f"{m}.png"
         with Image.open(refdir / filename) as im:
@@ -176,14 +180,37 @@ def evaluate(folder, group, stamp, maps, args):
             return {"status": "waiting_for_new_frame"}
         expected = occupancy(refs[m], boxes, wiki)
         eligible &= expected >= args.min_coverage
-        ratios.append(occupancy(maps[m], boxes, wiki) / np.maximum(expected, 1e-9))
+        current = occupancy(maps[m], boxes, wiki)
+        samples.append(current)
+        ratios.append(current / np.maximum(expected, 1e-9))
+        if adaptive:
+            # Score the chip interior for the wiki mask to reduce boundary bleed.
+            inset = (boxes[:, 2:] - boxes[:, :2]) * .22
+            core = np.hstack((boxes[:, :2] + inset, boxes[:, 2:] - inset))
+            if m == "rms":
+                dark_core = occupancy(refs[m], core, True) <= .10
+            else:
+                eligible &= ~(dark_core & (occupancy(refs[m], core, True) <= .10))
+
     candidates = eligible & (np.minimum(*ratios) <= args.ratio) & (np.maximum(*ratios) <= args.secondary_ratio)
     hits = set(np.flatnonzero(candidates).tolist())
+    details, extra, paused = {}, {}, set()
+    if adaptive:
+        for tile, chip in args.exclusions.get(str(group), []):
+            eligible &= ~((chips[:, 0] == tile) & (chips[:, 1] == chip))
+        details, extra, hits = score(np.asarray(samples), eligible, chips, stamp, state, args)
+        if hits is None:
+            save_json(statefile, dict(geometry=args.geometry, reference=args.reference, stamp=stamp,
+                                      titles=titles, hits=[], active=state.get("active", []), **extra))
+            return details
+        paused = {b["tile"] for b in details["broad_tile_losses"]} | set(details["insufficient_tiles"])
     consecutive = state.get("scoring") == "chip-v1" and stamp - state["stamp"] <= args.max_gap
     previous = set(state.get("hits", [])) if consecutive else set()
     active = set(state.get("active", []))
     events = []
     for tile in range(1, 9):
+        if tile in paused:
+            continue
         region = set(np.flatnonzero(chips[:, 0] == tile).tolist())
         persistent = hits & previous & region
         # Each tile occupies 100 consecutive indices in physical row-major order.
@@ -193,21 +220,21 @@ def evaluate(folder, group, stamp, maps, args):
         if supported and tile not in active:
             path = folder / f"{stamp}-T{tile}.png"
             indices = sorted(supported)
-            evidence(path, refs, maps, boxes[indices], group, stamp, reference_stamp)
+            evidence(path, refs, maps, boxes[indices], group, stamp, reference_stamp, adaptive)
             active.add(tile)
             events.append({"tile": tile, "event": "opened", "image": str(path),
                            "chips": sorted(chips[indices, 1].astype(int).tolist())})
-        elif tile in active and consecutive and not (hits | previous) & region:
+        elif tile in active and consecutive and tile not in state.get("paused", []) and not (hits | previous) & region:
             active.remove(tile)
             events.append({"tile": tile, "event": "resolved"})
-    save_json(statefile, dict(scoring="chip-v1", geometry=args.geometry, reference=args.reference, stamp=stamp, titles=titles, hits=sorted(hits), active=sorted(active)))
-    return dict(status="evaluated", stamp=stamp, active=sorted(active), events=events)
+    save_json(statefile, dict(scoring="chip-v1", geometry=args.geometry, reference=args.reference, stamp=stamp, titles=titles, hits=sorted(hits), active=sorted(active), paused=sorted(paused), **extra))
+    return {**details, "status": "evaluated", "stamp": stamp, "active": sorted(active), "events": events}
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("action", choices=("baseline", "check", "watch"))
-    p.add_argument("--reference", choices=("wiki", "captured"),
+    p.add_argument("--reference", choices=("wiki", "captured", "delayed"),
                    help="default: wiki for monitoring, captured for baseline")
     p.add_argument("--work", type=Path, help="default: runs/wiki or runs/default for captured")
     p.add_argument("--source", default=PORTAL, help="RealTime URL or local directory")
@@ -223,13 +250,19 @@ def main():
                    help="open on one persistent chip without a neighboring chip")
     p.add_argument("--min-coverage", type=float, default=.10)
     p.add_argument("--geometry", choices=("CRS_DAQ", "pacmon"), default="CRS_DAQ")
+    p.add_argument("--reconfig-ratio", type=float, default=.75,
+                   help="sudden whole-group ADC mean coverage ratio triggering a reconfiguration check")
+    p.add_argument("--exclusions", type=Path, help='reviewed delayed-mode mask JSON: {"4": [[1,110]]}')
     args = p.parse_args()
+    if not 0 < args.reconfig_ratio < .85:
+        p.error("--reconfig-ratio must be between 0 and .85")
+    args.exclusions = json.loads(args.exclusions.read_text()) if args.exclusions else {}
     if args.reference is None:
         args.reference = "captured" if args.action == "baseline" else "wiki"
-    if args.action == "baseline" and args.reference == "wiki":
+    if args.action == "baseline" and args.reference != "captured":
         p.error("wiki references are bundled; run check or watch")
     if args.work is None:
-        args.work = Path("runs/wiki" if args.reference == "wiki" else "runs/default")
+        args.work = Path("runs") / ("default" if args.reference == "captured" else args.reference)
     with np.load(Path(__file__).with_name(f"chips_{args.geometry}.npz")) as layout:
         args.chips = {group: layout[str(group)] for group in args.groups}
     if args.secondary_ratio is None:
