@@ -38,6 +38,7 @@ def score(current, allowed, chips, stamp, state, args):
         anchor = extra["last_good"]
     if anchor is not None:
         ratios = levels / np.maximum(anchor, .01)
+        result["tile_mean_ratios"] = vector(ratios[1:])
         result["iog_mean_ratio"] = round(float(ratios[0]), 4)
         if held is None and ratios[0] <= args.reconfig_ratio and (ratios[1:] <= .85).sum() >= 4:
             held = vector(anchor)
@@ -62,10 +63,18 @@ def score(current, allowed, chips, stamp, state, args):
     raw = current / np.maximum(baseline, .001)
     hits = set()
     diagnostics = []
+    tiles = []
     broad = []
     thin = []
     for tile in range(1, 9):
         ii = np.flatnonzero(eligible & (chips[:, 0] == tile))
+        others = eligible & (chips[:, 0] != tile)
+        audit = dict(tile=tile, eligible=len(ii), decision="insufficient",
+                     current=vector(np.mean(current[:, ii], axis=1)) if len(ii) else None,
+                     reference=vector(np.mean(baseline[:, ii], axis=1)) if len(ii) else None,
+                     retained=vector(np.median(raw[:, ii], axis=1)) if len(ii) else None,
+                     other_tiles_retained=vector(np.median(raw[:, others], axis=1)) if others.any() else None)
+        tiles.append(audit)
         if len(ii) < 10:
             thin.append(tile)
             continue
@@ -74,10 +83,8 @@ def score(current, allowed, chips, stamp, state, args):
         preliminary = (local.min(axis=0) <= args.ratio) & (local.max(axis=0) <= args.secondary_ratio)
         peer = np.median(local, axis=1)
         if peer.min() <= .50 and peer.max() <= .80:
-            others = eligible & (chips[:, 0] != tile)
             broad.append(dict(tile=tile, retained=vector(peer),
-                              other_tiles_retained=vector(np.median(raw[:, others], axis=1))
-                              if others.any() else None))
+                              other_tiles_retained=audit["other_tiles_retained"]))
             suspect = np.ones(len(ii), dtype=bool)
         else:
             peers = local[:, ~preliminary]
@@ -106,5 +113,5 @@ def score(current, allowed, chips, stamp, state, args):
         sample[:, int(key)] = ref
     history.append([stamp, vector(sample), vector(levels)])
     result.update(status="evaluated", broad_tile_losses=broad, insufficient_tiles=thin,
-                  candidates=diagnostics, previous_stamp=state.get("stamp"))
+                  tiles=tiles, candidates=diagnostics, previous_stamp=state.get("stamp"))
     return result, extra, hits

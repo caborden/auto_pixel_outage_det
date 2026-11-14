@@ -5,8 +5,6 @@ import hashlib
 import io
 import json
 import os
-import shutil
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -111,25 +109,12 @@ def save_json(path, value):
     os.replace(tmp, path)
 
 
-def baseline(folder, stamp, maps):
-    target = folder / "baseline"
-    if target.exists():
-        raise ValueError("baseline already exists; use a new --work directory")
-    with tempfile.TemporaryDirectory(dir=folder) as staging:
-        stage = Path(staging) / "baseline"
-        stage.mkdir()
-        for m, im in maps.items():
-            im.save(stage / f"{m}.png")
-        save_json(stage / "source.json", stamp)
-        stage.rename(target)
-
-
-def evidence(path, refs, maps, boxes, group, stamp, reference_stamp, adaptive=False):
+def evidence(path, refs, maps, boxes, group, stamp):
     canvas = Image.new("RGB", (860, 2 * 910), "white")
     pen = ImageDraw.Draw(canvas)
     font = ImageFont.load_default(size=18)
     for row, metric in enumerate(METRICS):
-        for col, (label, src, ts) in enumerate((("Wiki mask" if adaptive else "Reference", refs, reference_stamp), ("Current", maps, stamp))):
+        for col, (label, src, ts) in enumerate((("Wiki mask", refs, None), ("Current", maps, stamp))):
             original = src[metric]
             scale = min(420 / original.width, 850 / original.height)
             thumb = original.resize((round(original.width * scale), round(original.height * scale)),
@@ -144,71 +129,81 @@ def evidence(path, refs, maps, boxes, group, stamp, reference_stamp, adaptive=Fa
                 pen.rectangle((x+left+x0*(right-left), y+top+y0*(bottom-top),
                                x+left+x1*(right-left), y+top+y1*(bottom-top)),
                               outline="#0082ff", width=2)
-    canvas.save(path)
+    temporary = path.with_suffix(".tmp")
+    canvas.save(temporary, format="PNG")
+    os.replace(temporary, path)
 
 
 def evaluate(folder, group, stamp, maps, args):
-    adaptive = args.reference == "delayed"
-    wiki = args.reference != "captured"
-    refdir = Path(__file__).with_name("wiki_reference") if wiki else folder / "baseline"
-    reference_stamp = None if wiki else json.loads((refdir / "source.json").read_text())
+    refdir = Path(__file__).with_name("wiki_reference")
     statefile = folder / "state.json"
     state = json.loads(statefile.read_text()) if statefile.exists() else {}
     if state and state["geometry"] != args.geometry:
         raise ValueError("geometry changed; start a new --work directory")
     if state and state.get("reference", "captured") != args.reference:
         raise ValueError("reference changed; use separate --work directories")
-    if stamp <= max(state.get("stamp", 0), reference_stamp or 0):
+    if stamp <= state.get("stamp", 0):
         return {"status": "waiting_for_new_frame"}
     titles = {m: title_id(im) for m, im in maps.items()}
     refs = {}
     chips = args.chips[group]
     boxes = chips[:, 2:]
     eligible = np.ones(len(chips), dtype=bool)
-    ratios = []
+    inset = (boxes[:, 2:] - boxes[:, :2]) * .22
+    core = np.hstack((boxes[:, :2] + inset, boxes[:, 2:] - inset))
+    blank_core = np.ones(len(chips), dtype=bool)
     samples = []
     for m in METRICS:
-        filename = f"iog_{group}_{m}.png" if wiki else f"{m}.png"
-        with Image.open(refdir / filename) as im:
+        with Image.open(refdir / f"iog_{group}_{m}.png") as im:
             refs[m] = im.convert("RGB")
-        if not wiki and refs[m].size != maps[m].size:
-            raise ValueError("map size changed since baseline")
-        previous_title = state.get("titles", {}).get(m)
-        if previous_title is None and not wiki:
-            previous_title = title_id(refs[m])
-        if titles[m] == previous_title:
+        if titles[m] == state.get("titles", {}).get(m):
             return {"status": "waiting_for_new_frame"}
-        expected = occupancy(refs[m], boxes, wiki)
-        eligible &= expected >= args.min_coverage
-        current = occupancy(maps[m], boxes, wiki)
-        samples.append(current)
-        ratios.append(current / np.maximum(expected, 1e-9))
-        if adaptive:
-            # Score the chip interior for the wiki mask to reduce boundary bleed.
-            inset = (boxes[:, 2:] - boxes[:, :2]) * .22
-            core = np.hstack((boxes[:, :2] + inset, boxes[:, 2:] - inset))
-            if m == "rms":
-                dark_core = occupancy(refs[m], core, True) <= .10
-            else:
-                eligible &= ~(dark_core & (occupancy(refs[m], core, True) <= .10))
-
-    candidates = eligible & (np.minimum(*ratios) <= args.ratio) & (np.maximum(*ratios) <= args.secondary_ratio)
-    hits = set(np.flatnonzero(candidates).tolist())
-    details, extra, paused = {}, {}, set()
-    if adaptive:
-        for tile, chip in args.exclusions.get(str(group), []):
-            eligible &= ~((chips[:, 0] == tile) & (chips[:, 1] == chip))
-        details, extra, hits = score(np.asarray(samples), eligible, chips, stamp, state, args)
-        if hits is None:
-            save_json(statefile, dict(geometry=args.geometry, reference=args.reference, stamp=stamp,
-                                      titles=titles, hits=[], active=state.get("active", []), **extra))
-            return details
-        paused = {b["tile"] for b in details["broad_tile_losses"]} | set(details["insufficient_tiles"])
+        eligible &= occupancy(refs[m], boxes, True) >= args.min_coverage
+        blank_core &= occupancy(refs[m], core, True) <= .10
+        samples.append(occupancy(maps[m], boxes, True))
+    eligible &= ~blank_core
+    for tile, chip in args.exclusions.get(str(group), []):
+        eligible &= ~((chips[:, 0] == tile) & (chips[:, 1] == chip))
+    details, extra, hits = score(np.asarray(samples), eligible, chips, stamp, state, args)
+    incidents = state.get("incidents", {str(t): {"kind": "localized", "since": None}
+                                         for t in state.get("active", [])})
+    base = dict(geometry=args.geometry, reference="delayed", stamp=stamp, titles=titles,
+                incidents=incidents, active=state.get("active", []), **extra)
+    if hits is None:
+        if details["status"] == "likely_reconfiguration" and state.get("reconfig_anchor") is None:
+            path = folder / f"{stamp}-reconfig.png"
+            evidence(path, refs, maps, [], group, stamp)
+            details["image"] = str(path)
+        save_json(statefile, dict(base, hits=[]))
+        return details
+    broad = {b["tile"]: b for b in details["broad_tile_losses"]}
+    isolated = {t for t,b in broad.items() if b["other_tiles_retained"] and
+                min(b["other_tiles_retained"]) >= .75}
+    paused = set(broad) | set(details["insufficient_tiles"])
     consecutive = state.get("scoring") == "chip-v1" and stamp - state["stamp"] <= args.max_gap
     previous = set(state.get("hits", [])) if consecutive else set()
     active = set(state.get("active", []))
     events = []
     for tile in range(1, 9):
+        key = str(tile)
+        audit = details["tiles"][tile-1]
+        if tile in broad:
+            audit["decision"] = "broad_pending" if tile in isolated else "group_loss"
+            if consecutive and tile in isolated and tile in state.get("isolated", []):
+                audit["decision"] = "broad"
+                prior = incidents.get(key, {})
+                if prior.get("kind") != "broad":
+                    footprint = boxes[chips[:, 0] == tile]
+                    outline = np.r_[footprint[:, :2].min(axis=0), footprint[:, 2:].max(axis=0)]
+                    path = folder / f"{stamp}-T{tile}.png"
+                    evidence(path, refs, maps, [outline], group, stamp)
+                    event = "expanded" if tile in active else "opened"
+                    incidents[key] = dict(kind="broad", since=prior.get("since", state["stamp"]),
+                                          image=str(path))
+                    active.add(tile)
+                    events.append(dict(broad[tile], event=event, kind="broad", image=str(path),
+                                       first_broad=state["stamp"]))
+            continue
         if tile in paused:
             continue
         region = set(np.flatnonzero(chips[:, 0] == tile).tolist())
@@ -220,23 +215,26 @@ def evaluate(folder, group, stamp, maps, args):
         if supported and tile not in active:
             path = folder / f"{stamp}-T{tile}.png"
             indices = sorted(supported)
-            evidence(path, refs, maps, boxes[indices], group, stamp, reference_stamp, adaptive)
+            evidence(path, refs, maps, boxes[indices], group, stamp)
+            incidents[key] = dict(kind="localized", since=state["stamp"], image=str(path))
             active.add(tile)
-            events.append({"tile": tile, "event": "opened", "image": str(path),
+            events.append({"kind":"localized", "tile": tile, "event": "opened", "image": str(path),
                            "chips": sorted(chips[indices, 1].astype(int).tolist())})
         elif tile in active and consecutive and tile not in state.get("paused", []) and not (hits | previous) & region:
             active.remove(tile)
-            events.append({"tile": tile, "event": "resolved"})
-    save_json(statefile, dict(scoring="chip-v1", geometry=args.geometry, reference=args.reference, stamp=stamp, titles=titles, hits=sorted(hits), active=sorted(active), paused=sorted(paused), **extra))
+            events.append({"tile": tile, "event": "resolved", "kind": incidents.pop(key)["kind"]})
+        audit["decision"] = ("active_" + incidents[key]["kind"] if tile in active else
+                             "candidate" if hits & region else "clear")
+    save_json(statefile, dict(base, scoring="chip-v1", hits=sorted(hits), active=sorted(active),
+                              paused=sorted(paused), isolated=sorted(isolated)))
     return {**details, "status": "evaluated", "stamp": stamp, "active": sorted(active), "events": events}
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("baseline", "check", "watch"))
-    p.add_argument("--reference", choices=("wiki", "captured", "delayed"),
-                   help="default: wiki for monitoring, captured for baseline")
-    p.add_argument("--work", type=Path, help="default: runs/wiki or runs/default for captured")
+    p.add_argument("action", choices=("check", "watch"))
+    p.add_argument("--reference", choices=["delayed"], default="delayed", help=argparse.SUPPRESS)
+    p.add_argument("--work", type=Path, default=Path("runs/delayed"))
     p.add_argument("--source", default=PORTAL, help="RealTime URL or local directory")
     p.add_argument("--groups", type=int, nargs="+", choices=range(1, 9), default=list(range(1, 9)))
     p.add_argument("--interval", type=float, default=20)
@@ -257,12 +255,6 @@ def main():
     if not 0 < args.reconfig_ratio < .85:
         p.error("--reconfig-ratio must be between 0 and .85")
     args.exclusions = json.loads(args.exclusions.read_text()) if args.exclusions else {}
-    if args.reference is None:
-        args.reference = "captured" if args.action == "baseline" else "wiki"
-    if args.action == "baseline" and args.reference != "captured":
-        p.error("wiki references are bundled; run check or watch")
-    if args.work is None:
-        args.work = Path("runs") / ("default" if args.reference == "captured" else args.reference)
     with np.load(Path(__file__).with_name(f"chips_{args.geometry}.npz")) as layout:
         args.chips = {group: layout[str(group)] for group in args.groups}
     if args.secondary_ratio is None:
@@ -278,15 +270,11 @@ def main():
             try:
                 folder.mkdir(parents=True, exist_ok=True)
                 stamp, maps = acquire_with_retry(args, group, acquisition)
-                if args.action == "baseline":
-                    baseline(folder, stamp, maps)
-                    result = {"status": "baseline_saved", "stamp": stamp}
-                else:
-                    result = evaluate(folder, group, stamp, maps, args)
+                result = evaluate(folder, group, stamp, maps, args)
             except (OSError, ValueError, SyntaxError, EOFError, IncompleteRead) as exc:
                 result = {"status": "unavailable", "reason": str(exc)}
                 failed = True
-            print(json.dumps({"io_group": group, "reference": args.reference, **acquisition, **result}), flush=True)
+            print(json.dumps({"observed": int(time.time()), "io_group": group, "reference": args.reference, **acquisition, **result}), flush=True)
         if args.action != "watch":
             return int(failed)
         time.sleep(args.interval)
